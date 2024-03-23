@@ -3,6 +3,10 @@
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
       <sourceFolder url="file://$MODULE_DIR$/awq/kernels" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/awq.egg-info" />
+      <excludeFolder url="file://$MODULE_DIR$/awq/kernels/awq_inference_engine.egg-info" />
+      <excludeFolder url="file://$MODULE_DIR$/awq/kernels/build" />
+      <excludeFolder url="file://$MODULE_DIR$/awq/kernels/dist" />
     </content>
     <orderEntry type="jdk" jdkName="dequant" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />

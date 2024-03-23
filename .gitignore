@@ -171,3 +171,4 @@ cython_debug/
 **/*.pyc
 *.json
 __pycache__
+.idea
