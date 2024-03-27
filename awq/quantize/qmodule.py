@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 from .dequant_matmul import w4a16_matmul
+import awq_inference_engine
 
 
 def make_divisible(c, divisor):
@@ -197,12 +198,15 @@ class WQLinear(nn.Module):
 
     @torch.no_grad()
     def forward(self, x):
+        inputs = x
         out_shape = x.shape[:-1] + (self.out_features,)
         inputs = x.reshape(-1, x.shape[-1])
-        inputs = x
+        m, n = self.qweight.shape
+        w = torch.randn((n, n), dtype=torch.float16, device='cuda')
         if inputs.numel() / inputs.shape[-1] < 8:
             out = w4a16_matmul(
                 inputs,
+                w,
                 self.qweight,
                 self.scales,
                 self.scaled_zeros,
@@ -213,14 +217,15 @@ class WQLinear(nn.Module):
             )
         else:
             out = w4a16_matmul(
-                inputs, self.qweight, self.scales, self.scaled_zeros, self.group_size
+                inputs, w, self.qweight, self.scales, self.scaled_zeros, self.group_size
             )  # - 8.0 * self.scales)
         out = out + self.bias if self.bias is not None else out
         # print(out)
         # assert 0
         return out
 
-    def extra_repr(self) -> str:
+
+def extra_repr(self) -> str:
         return (
             "in_features={}, out_features={}, bias={}, w_bit={}, group_size={}".format(
                 self.in_features,

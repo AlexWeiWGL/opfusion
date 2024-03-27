@@ -2,233 +2,147 @@ import torch
 
 import triton
 import triton.language as tl
+import awq_inference_engine
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+    ],
+    key=['M', 'N', 'K'],
+)
+
+
 
 @triton.jit
-def _zp_dequant_matmul_kernel(
-    a_ptr, b_ptr, c_ptr,   #pointers to matrices
-    scales_ptr, zeros_ptr, #pointers to scales and zeros
-    M, N, K,               #matrix dimensions
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
+def gemm_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+    mid = tl.program_id(0)
+    nid = tl.program_id(1)
+    # Starting row + BLOCK_SIZE_M more rows
+
+    a_rows = mid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    # Starting col + BLOCK_SIZE_N more columns
+    b_cols = nid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+    a_ptrs = a_ptr + a_rows[:, None] * K + tl.arange(0, BLOCK_SIZE_K)[None, :]
+    b_ptrs = b_ptr + tl.arange(0, BLOCK_SIZE_K)[:, None] * N + b_cols[None, :]
+
+    c = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
+    for k in range(K//BLOCK_SIZE_K):
+        a = tl.load(a_ptrs)
+        b = tl.load(b_ptrs)
+        c += tl.dot(a, b)
+        a_ptrs += BLOCK_SIZE_K
+        b_ptrs += BLOCK_SIZE_K * N
+
+    c = c.to(tl.float16)
+
+    # C's block's offsets
+    c_ptrs = a_rows[:, None] * N + b_cols[None, :]
+    tl.store(c_ptr+ c_ptrs, c)
+
+
+def gemm(a, b):
+    c = torch.empty([M, N], device=a.device, dtype=a.dtype)
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_SIZE_M']), triton.cdiv(N, META['BLOCK_SIZE_N']),
+    )
+    gemm_kernel[grid](a, b, c, M, N, K)
+    return c
+
+@triton.jit
+def _zp_dequant_kernel(
+    Q, Out,
+    scales_ptr, zeros_ptr,
+    stride_qk, stride_qn,
+    stride_ok, stride_on,
     stride_scales_g, stride_scales_n,
     stride_zeros_g, stride_zeros_n,
     groupsize,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
 ):
     """
-    Compute the matrix multiplication C = A x dequant(B).
-    A is of shape (M, K) float16
-    B is of shape (K//8, N) int32
-    C is of shape (M, N) float16
+    Dequant qweight to output matrix.
+    Q is of shape (K//8, N) int32
+    Out is of shape (K, N) float16
     scales is of shape (G, N) float16, where G is K // groupsize
     zeros is of shape (G, N//8) int32
     """
-    # map prograim id to the block of C(m, n)
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_k = tl.cdiv(K, BLOCK_SIZE_K)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    pid_k = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    gid = pid_k // groupsize
 
-    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-    # pointers for the first blocks of A and B
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    a_mask = (offs_am[:, None] < M)
-    # it repeats elements along the K axis 8 times, as we pack 8-int4 to 1-int32 in the matrix of B
-    b_ptrs = b_ptr + ((offs_k[:, None] // 8) * stride_bk + offs_bn[None, :] * stride_bn)
+    # pointers
+    offs_q = (pid_k // 8) * stride_qk + offs_n * stride_qn
+    offs_scales = gid * stride_scales_g + offs_n * stride_scales_n
+    offs_zeros = gid * stride_zeros_g + (offs_n // 8) * stride_zeros_n
 
-    # pointers for the first blocks of scales and zeros
-    scales_ptrs = scales_ptr + offs_bn * stride_scales_n   # (BLOCK_SIZE_N,)
-    zeros_ptrs = zeros_ptr + ((offs_bn // 8) * stride_zeros_n)   # (BLOCK_SIZE_N,)
+    # shifter
+    shifter = (pid_k % 8) * 4
+    zeros_shifter = (offs_n % 8) * 4
 
-    # shifter is used to extract the 4 bits of each element in the 32-bit word from B and zeros
-    shifter = (offs_k % 8) * 4
-    zeros_shifter = (offs_bn % 8) * 4
+    # load
+    weight = tl.load(Q + offs_q)
+    scales = tl.load(scales_ptr + offs_scales)
+    zeros = tl.load(zeros_ptr + offs_zeros).to(dtype=tl.int32)
 
-    # calculate a block of output of shape (BLOCK_SIZE_M, BLOCK_SIZE_N)
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, num_pid_k):
-        # load a and b
-        a = tl.load(a_ptrs, mask=a_mask, other=0.)   # (BLOCK_SIZE_M, BLOCK_SIZE_K)
-        b = tl.load(b_ptrs)                          # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+    # unpack weight and zeros
+    weight = (weight >> shifter) & 0xF
+    zeros = (zeros >> zeros_shifter) & 0xF
+    zeros = (zeros + 1)
 
-        # load scales and zeros
-        g_id = k // (groupsize // BLOCK_SIZE_K)
-        ptr = scales_ptrs + g_id * stride_scales_g
-        scales = tl.load(ptr)  # (BLOCK_SIZE_N,)
-        ptr = zeros_ptrs + g_id * stride_zeros_g
-        zeros = tl.load(ptr)   # (BLOCK_SIZE_N,)
-
-        # unpack b and zeros
-        b = (b >> shifter[:, None]) & 0xF
-        zeros = (zeros >> zeros_shifter) & 0xF
-        zeros = (zeros + 1) # as auto-gptq stores the values of zeros-1
-
-        # dequant b
-        b = (b - zeros[None, :]) * scales[None, :]
-
-        # matmul
-        accumulator += tl.dot(a, b)
-
-        # update pointers
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += (BLOCK_SIZE_K // 8) * stride_bk
-
+    # dequant weight
+    weight = (weight - zeros) * scales
 
     # store the result
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+    offs_o = pid_k * stride_ok + offs_n * stride_on
+    tl.store(Out + offs_o, weight)
 
 
-@triton.jit
-def _sym_dequant_matmul_kernel(
-    a_ptr, b_ptr, c_ptr,   #pointers to matrices
-    scales_ptr,            #pointers to scales
-    ZERO,
-    M, N, K,               #matrix dimensions
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    stride_scales_g, stride_scales_n,
-    groupsize,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    """
-    Compute the matrix multiplication C = A x dequant(B).
-    A is of shape (M, K) float16
-    B is of shape (K//8, N) int32
-    C is of shape (M, N) float16
-    scales is of shape (G, N) float16, where G is K // groupsize
-    ZERO is 8 for symmetric quantization, where 2**(bits-1)=8
-    """
-    # map prograim id to the block of C(m, n)
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_k = tl.cdiv(K, BLOCK_SIZE_K)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-
-    # pointers for the first blocks of A and B
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    a_mask = (offs_am[:, None] < M)
-    # it repeats elements along the K axis 8 times, as we pack 8-int4 to 1-int32 in the matrix of B
-    b_ptrs = b_ptr + ((offs_k[:, None] // 8) * stride_bk + offs_bn[None, :] * stride_bn)
-
-    # pointers for the first blocks of scales
-    scales_ptrs = scales_ptr + offs_bn * stride_scales_n   # (BLOCK_SIZE_N,)
-
-    # shifter is used to extract the 4 bits of each element in the 32-bit word from B
-    shifter = (offs_k % 8) * 4
-
-    # calculate a block of output of shape (BLOCK_SIZE_M, BLOCK_SIZE_N)
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, num_pid_k):
-        # load a and b
-        a = tl.load(a_ptrs, mask=a_mask, other=0.)   # (BLOCK_SIZE_M, BLOCK_SIZE_K)
-        b = tl.load(b_ptrs)                          # (BLOCK_SIZE_K, BLOCK_SIZE_N)
-
-        # load scales
-        g_id = k // (groupsize // BLOCK_SIZE_K)
-        ptr = scales_ptrs + g_id * stride_scales_g
-        scales = tl.load(ptr)  # (BLOCK_SIZE_N,)
-
-        # unpack b
-        b = (b >> shifter[:, None]) & 0xF
-
-        # dequant b
-        b = (b - ZERO) * scales[None, :]
-
-        # matmul
-        accumulator += tl.dot(a, b)
-
-        # update pointers
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += (BLOCK_SIZE_K // 8) * stride_bk
-
-
-    # store the result
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
-
-
-def w4a16_matmul(x, qweight, scales, qzeros, group_size, sym=False):
-    block_size_m=16
-    block_size_n=16
-    block_size_k=64
-
-    M, K = x.shape
+def w4a16_matmul(x, w, qweight, scales, qzeros, group_size, sym=False):
+    block_size_n=128
+    K = x.shape[1]
     N = qweight.shape[1]
 
     # shape constraints
     assert x.shape[-1] == (qweight.shape[0] * 8), "Incompatible dimensions"
-    assert x.is_contiguous(), "A must be contiguous"
-    assert K % block_size_k == 0, "K must be a multiple of block_size_k"
+    assert x.shape[-1] == w.shape[0], "Incompatible dimensions"
+    assert w.shape[-1] == qweight.shape[-1], "Incompatible dimensions"
     assert K % group_size == 0, "K must be a multiple of group size"
     assert N % block_size_n == 0, "N must be a multiple of block_size_n"
-    assert group_size % block_size_k == 0, "Group size must be a multiple of block_size_k"
 
-    # allocate output
-    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    grid = (K, N // block_size_n)
 
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),)
+    # dequant qweight to w
 
-    if sym:
-        zeropoint = 8
-        _sym_dequant_matmul_kernel[grid](
-            x, qweight, c,
-            scales,
-            zeropoint,
-            M, N, K,
-            x.stride(0), x.stride(1),
-            qweight.stride(0), qweight.stride(1),
-            c.stride(0), c.stride(1),
-            scales.stride(0), scales.stride(1),
-            group_size,
-            block_size_m, block_size_n, block_size_k,
-            GROUP_SIZE_M=8,
-            num_warps=2, num_stages=4,
-        )
-    else:
-        _zp_dequant_matmul_kernel[grid](
-            x, qweight, c,
+    stream1 = torch.cuda.Stream('cuda')
+    stream2 = torch.cuda.current_stream('cuda')
+
+    with torch.cuda.stream(stream1):
+        _zp_dequant_kernel[grid](
+            qweight, w,
             scales, qzeros,
-            M, N, K,
-            x.stride(0), x.stride(1),
             qweight.stride(0), qweight.stride(1),
-            c.stride(0), c.stride(1),
+            w.stride(0), w.stride(1),
             scales.stride(0), scales.stride(1),
             qzeros.stride(0), qzeros.stride(1),
             group_size,
-            block_size_m, block_size_n, block_size_k,
-            GROUP_SIZE_M=8,
+            block_size_n,
             num_warps=2, num_stages=4,
         )
+    with torch.cuda.stream(stream2):
+        c = gemm(x, w)
+    stream2.wait_stream(stream1)
     return c
 
 def torch_w4a16_matmul(x, qweight, scales, qzeros, group_size, sym=False):
@@ -255,36 +169,110 @@ def torch_w4a16_matmul(x, qweight, scales, qzeros, group_size, sym=False):
     output = torch.matmul(x, weight.to(x.dtype))
     return output
 
-# if __name__ == "__main__":
-#     torch.manual_seed(0)
-#     M, N, K = 1, 4096, 4096
-#     group_size = 128
-#
-#     a = torch.randn((M, K), device='cuda', dtype=torch.float16)
-#     qweight = torch.randint(low=-2147483648, high=2147483647, size=(K//8, N), device='cuda', dtype=torch.int32)
-#     scales = torch.randn((K//group_size, N), device='cuda', dtype=torch.float16)
-#     qzeros = torch.randint(low=-2147483648, high=2147483647, size=(K//group_size, N//8), device='cuda', dtype=torch.int32)
-#     ref_weight = torch.randn((K, N), device='cuda', dtype=torch.float16)
-#
-#     # test
-#     print("Zeropoint quantization.")
-#     triton_output = w4a16_matmul(a, qweight, scales, qzeros, group_size, sym=False)
-#     torch_output = torch_w4a16_matmul(a, qweight, scales, qzeros, group_size, sym=False)
-#     print(f"triton_output={triton_output}")
-#     print(f"torch_output={torch_output}")
-#     print(f'The maximum difference between torch and triton is {torch.max(torch.abs(torch_output - triton_output))}')
-#
-#     print("\nSymmetric quantization.")
-#     triton_output = w4a16_matmul(a, qweight, scales, qzeros, group_size, sym=True)
-#     torch_output = torch_w4a16_matmul(a, qweight, scales, qzeros, group_size, sym=True)
-#     print(f"triton_output={triton_output}")
-#     print(f"torch_output={torch_output}")
-#     print(f'The maximum difference between torch and triton is {torch.max(torch.abs(torch_output - triton_output))}')
-#
-#     # benchmark
-#     print(f"\nBenchmark with bs={M}.")
-#     print("fp16:", triton.testing.do_bench(lambda: torch.matmul(a, ref_weight)))
-#     print("torch zp:", triton.testing.do_bench(lambda: torch_w4a16_matmul(a, qweight, scales, qzeros, group_size, sym=False)))
-#     print("triton zp:", triton.testing.do_bench(lambda: w4a16_matmul(a, qweight, scales, qzeros, group_size, sym=False)))
-#     print("torch sym:", triton.testing.do_bench(lambda: torch_w4a16_matmul(a, qweight, scales, qzeros, group_size, sym=True)))
-#     print("triton sym:", triton.testing.do_bench(lambda: w4a16_matmul(a, qweight, scales, qzeros, group_size, sym=True)))
+def multi_layer_torch(layers, a_map, qweight_map, scale_map, qzeros_map, group_size):
+    for i in range(layers):
+        a = a_map[i]
+        qweight = qweight_map[i].to(torch.int32)
+        scales = scale_map[i]
+        qzeros = qzeros_map[i].to(torch.int32)
+
+        torch_w4a16_matmul(a, qweight, scales, qzeros, group_size, )
+
+def multi_layer_awq(layers, a_map, qweight_map, scale_map, qzeros_map):
+    for i in range(layers):
+        a = a_map[i]
+        qweight = qweight_map[i].short()
+        scales = scale_map[i]
+        qzeros = qzeros_map[i].half()
+
+        awq_inference_engine.gemm_forward_cuda_new(a, qweight, scales, qzeros)
+
+
+def multi_layer_triton(layers, a_map, ref_weights, qweight_map, scale_map, qzeros_map, group_size):
+
+    for i in range(layers):
+        a = a_map[i]
+        qweight = qweight_map[i].to(torch.int32)
+        scales = scale_map[i]
+        qzeros = qzeros_map[i]
+        ref_weight = ref_weights[i]
+
+        block_size_n = 128
+        K = a.shape[1]
+        N = qweight.shape[1]
+
+        # shape constraints
+        assert a.shape[-1] == (qweight.shape[0] * 8), "Incompatible dimensions"
+        assert a.shape[-1] == ref_weight.shape[0], "Incompatible dimensions"
+        assert ref_weight.shape[-1] == qweight.shape[-1], "Incompatible dimensions"
+        assert K % group_size == 0, "K must be a multiple of group size"
+        assert N % block_size_n == 0, "N must be a multiple of block_size_n"
+
+        grid = (K, N // block_size_n)
+
+        stream1 = torch.cuda.Stream('cuda')
+        stream2 = torch.cuda.current_stream('cuda')
+
+        with torch.cuda.stream(stream1):
+            _zp_dequant_kernel[grid](
+                qweight, ref_weight,
+                scales, qzeros,
+                qweight.stride(0), qweight.stride(1),
+                ref_weight.stride(0), ref_weight.stride(1),
+                scales.stride(0), scales.stride(1),
+                qzeros.stride(0), qzeros.stride(1),
+                group_size,
+                block_size_n,
+                num_warps=2, num_stages=4
+            )
+
+        with torch.cuda.stream(stream2):
+            gemm(a, ref_weight)
+        stream2.wait_stream(stream1)
+
+
+
+
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    M, N, K = 4000, 4096, 4096
+    group_size = 128
+
+    a_map = []
+    qweight_map = []
+    scale_map = []
+    qzeros_map = []
+    ref_weights = []
+
+    for i in range(10):
+        a = torch.randn((M, K), device='cuda', dtype=torch.float16)
+        qweight = torch.randint(low=-2147483648, high=2147483647, size=(K // 8, N), device='cuda', dtype=torch.int32)
+        scales = torch.randn((K // group_size, N), device='cuda', dtype=torch.float16)
+        qzeros = torch.randn(size=(K // group_size, N // 8), device='cuda', dtype=torch.float16)
+        ref_weight = torch.randn((K, N), device='cuda', dtype=torch.float16)
+        a_map.append(a)
+        qweight_map.append(qweight)
+        scale_map.append(scales)
+        qzeros_map.append(qzeros)
+        ref_weights.append(ref_weight)
+
+
+
+    # print(qweight.short())
+    # print(qzeros.to(torch.float16))
+    #
+    # print("Zeropoint quantization.")
+    # awq_output = awq_inference_engine.gemm_forward_cuda_new(a, qweight.short(), scales, qzeros)
+    # triton_output = w4a16_matmul(a, ref_weight, qweight.to(torch.int32), scales, qzeros, group_size, sym=False)
+    # torch_output = torch_w4a16_matmul(a, qweight, scales, qzeros.to(torch.int32), group_size, sym=False)
+    # print(f"triton_output={triton_output}")
+    # print(f"torch_output={torch_output}")
+    # print(f"awq_output={awq_output}")
+    #print(f'The maximum difference between torch and triton is {torch.max(torch.abs(awq_output - triton_output))}')
+
+
+    # benchmark
+    print(f"\nBenchmark with bs={M}.")
+    print("fp16:", triton.testing.do_bench(lambda: multi_layer_torch(10, a_map, qweight_map, scale_map, qzeros_map, group_size)))
+    print("awq zp:", triton.testing.do_bench(lambda: multi_layer_awq(10, a_map, qweight_map, scale_map, qzeros_map)))
+    print("triton zp:", triton.testing.do_bench(lambda: multi_layer_triton(10, a_map, ref_weights, qweight_map, scale_map, qzeros_map, group_size)))
