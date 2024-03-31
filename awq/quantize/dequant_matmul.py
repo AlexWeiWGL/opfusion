@@ -3,6 +3,7 @@ import torch
 import triton
 import triton.language as tl
 import awq_inference_engine
+import dequant_gptq
 
 @triton.autotune(
     configs=[
@@ -19,7 +20,6 @@ import awq_inference_engine
     ],
     key=['M', 'N', 'K'],
 )
-
 
 
 @triton.jit
@@ -108,43 +108,6 @@ def _zp_dequant_kernel(
     offs_o = pid_k * stride_ok + offs_n * stride_on
     tl.store(Out + offs_o, weight)
 
-
-def w4a16_matmul(x, w, qweight, scales, qzeros, group_size, sym=False):
-    block_size_n=128
-    K = x.shape[1]
-    N = qweight.shape[1]
-
-    # shape constraints
-    assert x.shape[-1] == (qweight.shape[0] * 8), "Incompatible dimensions"
-    assert x.shape[-1] == w.shape[0], "Incompatible dimensions"
-    assert w.shape[-1] == qweight.shape[-1], "Incompatible dimensions"
-    assert K % group_size == 0, "K must be a multiple of group size"
-    assert N % block_size_n == 0, "N must be a multiple of block_size_n"
-
-    grid = (K, N // block_size_n)
-
-    # dequant qweight to w
-
-    stream1 = torch.cuda.Stream('cuda')
-    stream2 = torch.cuda.current_stream('cuda')
-
-    with torch.cuda.stream(stream1):
-        _zp_dequant_kernel[grid](
-            qweight, w,
-            scales, qzeros,
-            qweight.stride(0), qweight.stride(1),
-            w.stride(0), w.stride(1),
-            scales.stride(0), scales.stride(1),
-            qzeros.stride(0), qzeros.stride(1),
-            group_size,
-            block_size_n,
-            num_warps=2, num_stages=4,
-        )
-    with torch.cuda.stream(stream2):
-        c = gemm(x, w)
-    stream2.wait_stream(stream1)
-    return c
-
 def torch_w4a16_matmul(x, qweight, scales, qzeros, group_size, sym=False):
     # unpack qweight
     qweight = torch.repeat_interleave(qweight, dim=0, repeats=8)  #(K//8, N) -> (K, N)
@@ -169,94 +132,88 @@ def torch_w4a16_matmul(x, qweight, scales, qzeros, group_size, sym=False):
     output = torch.matmul(x, weight.to(x.dtype))
     return output
 
-def multi_layer_torch(layers, a_map, qweight_map, scale_map, qzeros_map, group_size):
-    for i in range(layers):
-        a = a_map[i]
-        qweight = qweight_map[i].to(torch.int32)
-        scales = scale_map[i]
-        qzeros = qzeros_map[i].to(torch.int32)
 
-        torch_w4a16_matmul(a, qweight, scales, qzeros, group_size, )
+def w4a16_matmul(x, w, qweight, scales, qzeros, group_size):
+    block_size_n=128
+    K = x.shape[1]
+    N = qweight.shape[1]
 
-def multi_layer_awq(layers, a_map, qweight_map, scale_map, qzeros_map):
-    for i in range(layers):
-        a = a_map[i]
-        qweight = qweight_map[i].short()
-        scales = scale_map[i]
-        qzeros = qzeros_map[i].half()
+    # shape constraints
+    assert x.shape[-1] == (qweight.shape[0] * 8), "Incompatible dimensions"
+    assert x.shape[-1] == w.shape[0], "Incompatible dimensions"
+    assert w.shape[-1] == qweight.shape[-1], "Incompatible dimensions"
+    assert K % group_size == 0, "K must be a multiple of group size"
+    assert N % block_size_n == 0, "N must be a multiple of block_size_n"
 
-        awq_inference_engine.gemm_forward_cuda_new(a, qweight, scales, qzeros)
+    grid = (K, N // block_size_n)
 
+    # dequant qweight to w
 
-def multi_layer_triton(layers, a_map, ref_weights, qweight_map, scale_map, qzeros_map, group_size):
-
-    for i in range(layers):
-        a = a_map[i]
-        qweight = qweight_map[i].to(torch.int32)
-        scales = scale_map[i]
-        qzeros = qzeros_map[i]
-        ref_weight = ref_weights[i]
-
-        block_size_n = 128
-        K = a.shape[1]
-        N = qweight.shape[1]
-
-        # shape constraints
-        assert a.shape[-1] == (qweight.shape[0] * 8), "Incompatible dimensions"
-        assert a.shape[-1] == ref_weight.shape[0], "Incompatible dimensions"
-        assert ref_weight.shape[-1] == qweight.shape[-1], "Incompatible dimensions"
-        assert K % group_size == 0, "K must be a multiple of group size"
-        assert N % block_size_n == 0, "N must be a multiple of block_size_n"
-
-        grid = (K, N // block_size_n)
-
-        stream1 = torch.cuda.Stream('cuda')
-        stream2 = torch.cuda.current_stream('cuda')
-
-        with torch.cuda.stream(stream1):
-            _zp_dequant_kernel[grid](
-                qweight, ref_weight,
-                scales, qzeros,
-                qweight.stride(0), qweight.stride(1),
-                ref_weight.stride(0), ref_weight.stride(1),
-                scales.stride(0), scales.stride(1),
-                qzeros.stride(0), qzeros.stride(1),
-                group_size,
-                block_size_n,
-                num_warps=2, num_stages=4
-            )
-
-        with torch.cuda.stream(stream2):
-            gemm(a, ref_weight)
-        stream2.wait_stream(stream1)
+    _zp_dequant_kernel[grid](
+        qweight, w,
+        scales, qzeros,
+        qweight.stride(0), qweight.stride(1),
+        w.stride(0), w.stride(1),
+        scales.stride(0), scales.stride(1),
+        qzeros.stride(0), qzeros.stride(1),
+        group_size,
+        block_size_n,
+        num_warps=2, num_stages=4,
+    )
+    c = torch.matmul(x, w)
+    return c
 
 
+def gptq_matmul(a, qweight, scales, qzeros, group_size):
+    g_idx = torch.tensor([i//group_size for i in range(512)], device='cuda')
+    dequant_gptq.quant_matmul_248(a, qweight, scales, qzeros, g_idx, 4)
 
+def triton_matmul(a,ref_weight, qweight, scales, qzeros, group_size, stream1, stream2):
+    block_size_n = 128
+    K = a.shape[1]
+    N = qweight.shape[1]
+
+    # shape constraints
+    assert a.shape[-1] == (qweight.shape[0] * 8), "Incompatible dimensions"
+    assert a.shape[-1] == ref_weight.shape[0], "Incompatible dimensions"
+    assert ref_weight.shape[-1] == qweight.shape[-1], "Incompatible dimensions"
+    assert K % group_size == 0, "K must be a multiple of group size"
+    assert N % block_size_n == 0, "N must be a multiple of block_size_n"
+
+    grid = (K, N // block_size_n)
+
+    with torch.cuda.stream(stream1):
+        _zp_dequant_kernel[grid](
+            qweight, ref_weight,
+            scales, qzeros,
+            qweight.stride(0), qweight.stride(1),
+            ref_weight.stride(0), ref_weight.stride(1),
+            scales.stride(0), scales.stride(1),
+            qzeros.stride(0), qzeros.stride(1),
+            group_size,
+            block_size_n,
+            num_warps=2, num_stages=4
+        )
+
+    with torch.cuda.stream(stream2):
+        torch.matmul(a, ref_weight)
+    stream2.wait_stream(stream1)
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    M, N, K = 4000, 4096, 4096
+    M, N, K = 10, 512, 512
     group_size = 128
 
-    a_map = []
-    qweight_map = []
-    scale_map = []
-    qzeros_map = []
-    ref_weights = []
-
-    for i in range(10):
-        a = torch.randn((M, K), device='cuda', dtype=torch.float16)
-        qweight = torch.randint(low=-2147483648, high=2147483647, size=(K // 8, N), device='cuda', dtype=torch.int32)
-        scales = torch.randn((K // group_size, N), device='cuda', dtype=torch.float16)
-        qzeros = torch.randn(size=(K // group_size, N // 8), device='cuda', dtype=torch.float16)
-        ref_weight = torch.randn((K, N), device='cuda', dtype=torch.float16)
-        a_map.append(a)
-        qweight_map.append(qweight)
-        scale_map.append(scales)
-        qzeros_map.append(qzeros)
-        ref_weights.append(ref_weight)
+    a = torch.randn((M, K), device='cuda', dtype=torch.float16)
+    qweight = torch.randint(low=-2147483648, high=2147483647, size=(K // 8, N), device='cuda', dtype=torch.int32)
+    scales = torch.randn((K // group_size, N), device='cuda', dtype=torch.float16)
+    qzeros = torch.randint(low=-2147483648, high=2147483647, size=(K // group_size, N // 8), device='cuda',
+                           dtype=torch.int32)
+    ref_weight = torch.randn((K, N), device='cuda', dtype=torch.float16)
 
 
+    stream1 = torch.cuda.Stream('cuda')
+    stream2 = torch.cuda.current_stream('cuda')
 
     # print(qweight.short())
     # print(qzeros.to(torch.float16))
@@ -273,6 +230,46 @@ if __name__ == "__main__":
 
     # benchmark
     print(f"\nBenchmark with bs={M}.")
-    print("fp16:", triton.testing.do_bench(lambda: multi_layer_torch(10, a_map, qweight_map, scale_map, qzeros_map, group_size)))
-    print("awq zp:", triton.testing.do_bench(lambda: multi_layer_awq(10, a_map, qweight_map, scale_map, qzeros_map)))
-    print("triton zp:", triton.testing.do_bench(lambda: multi_layer_triton(10, a_map, ref_weights, qweight_map, scale_map, qzeros_map, group_size)))
+    print("torch zp:", triton.testing.do_bench(lambda: torch_w4a16_matmul(a, qweight, scales, qzeros, group_size)))
+    print("triton zp:", triton.testing.do_bench(lambda: triton_matmul(a, ref_weight, qweight, scales, qzeros, group_size, stream1, stream2)))
+    print("fp16", triton.testing.do_bench(lambda: torch.matmul(a, ref_weight)))
+    print("gptq", triton.testing.do_bench(lambda: gptq_matmul(a, qweight, scales, qzeros, group_size)))
+
+    # @triton.testing.perf_report(
+    #     triton.testing.Benchmark(
+    #         x_names=['M', 'N', 'K'],
+    #         x_vals=[128 * i for i in range(30)],
+    #         line_arg='provider',
+    #         line_vals=['fp16', 'triton_stream', 'torch'],
+    #         line_names=["FP16","Triton_Stream", "Torch"],
+    #         styles=[('green', '-'), ('blue', '-'), ('red', '-')],
+    #         ylabel = 'TFlOPS',
+    #         plot_name='different matmal methods',
+    #         args={},
+    #     )
+    # )
+    #
+    # def benckmark(M, N, K, provider):
+    #     ms = 1
+    #     max_ms = 1
+    #     min_ms = 1
+    #     a = torch.randn((M, K), device='cuda', dtype=torch.float16)
+    #     qweight = torch.randint(low=-2147483648, high=2147483647, size=(K // 8, N), device='cuda', dtype=torch.int32)
+    #     scales = torch.randn((K // group_size, N), device='cuda', dtype=torch.float16)
+    #     qzeros = torch.randint(low=-2147483648, high=2147483647, size=(K // group_size, N // 8), device='cuda',
+    #                            dtype=torch.int32)
+    #     ref_weight = torch.randn((K, N), device='cuda', dtype=torch.float16)
+    #
+    #     quantiles = [0.5, 0.2, 0.8]
+    #     if provider == 'fp16':
+    #         ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, ref_weight), quantiles=quantiles)
+    #     if provider == 'triton_stream':
+    #         ms, min_ms, max_ms = triton.testing.do_bench(lambda: triton_matmul(a, ref_weight, qweight, scales, qzeros, group_size, stream1, stream2), quantiles=quantiles)
+    #     if provider == 'torch':
+    #         ms, min_ms, max_ms = triton.testing.do_bench(lambda: w4a16_matmul(a, ref_weight, qweight, scales, qzeros, group_size), quantiles=quantiles)
+    #     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
+    #     return perf(ms), perf(max_ms), perf(min_ms)
+    # benckmark.run(show_plots=True, print_data=True)
+    #
+    #
+    #
