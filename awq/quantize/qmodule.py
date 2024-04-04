@@ -204,20 +204,20 @@ class WQLinear(nn.Module):
         m, n = self.qweight.shape
         w = torch.randn((n, n), dtype=torch.float16, device='cuda')
         if inputs.numel() / inputs.shape[-1] < 8:
-            out = w4a16_matmul(
+            out = awq_inference_engine.gemv_forward_cuda_new(
                 inputs,
                 w,
                 self.qweight,
                 self.scales,
                 self.scaled_zeros,
                 inputs.numel() // inputs.shape[-1],
-                # self.out_features,
-                # self.in_features,
+                self.out_features,
+                self.in_features,
                 self.group_size,
             )
         else:
-            out = w4a16_matmul(
-                inputs, w, self.qweight, self.scales, self.scaled_zeros, self.group_size
+            out = awq_inference_engine.gemm_forward_cuda_new(
+                inputs, w, self.qweight, self.scales, self.scaled_zeros,
             )  # - 8.0 * self.scales)
         out = out + self.bias if self.bias is not None else out
         # print(out)
