@@ -189,6 +189,10 @@ def gptq_matmul(layers, a, qweight, scales, qzeros, group_size):
     for i in range(layers):
         dequant_gptq.quant_matmul_248(a[i], qweight[i], scales[i], qzeros[i], g_idx, 4)
 
+def torch_matmul(layers, a, qweight):
+    for z in range(layers):
+        torch.matmul(a[z], qweight[z])
+    return 0
 
 def triton_matmul(a, ref_weight, qweight, scales, qzeros, group_size, stream1, stream2):
     block_size_n = 128
@@ -238,7 +242,7 @@ if __name__ == "__main__":
     stream2 = torch.cuda.current_stream('cuda')
 
     # 生成一个模拟用的网络，模拟pipeline
-    layers = 10
+    layers = 50
     inputs = []
     qweights = []
     scaless = []
@@ -278,12 +282,12 @@ if __name__ == "__main__":
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=['M'],
-            x_vals=[128 * i for i in range(0, 50)],
+            x_vals=[128 * i for i in range(10, 31)],
             line_arg='provider',
-            line_vals=['gptq_stream', 'gptq'],
-            line_names=['GPTQ_with_Stream', 'GPTQ'],
-            styles=[('green', '-'), ('blue', '-')],
-            ylabel = 'TFlOPS',
+            line_vals=[ 'fp16', 'gptq', 'gptq_stream'],
+            line_names=['FP16', 'GPTQ', 'GPTQ-Stream'],
+            styles=[('blue', '-'), ('red', '-'), ('green', '-')],
+            ylabel = 'TIME(ms)',
             plot_name='different matmal methods',
             args={},
         )
@@ -317,8 +321,12 @@ if __name__ == "__main__":
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: gptq_matmul(layers, inputs, qweights, scaless, qzeross, group_size), quantiles=quantiles
             )
+        if provider == 'fp16':
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: torch_matmul(layers, inputs, ref_weights), quantiles=quantiles
+            )
         perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
-        return perf(ms), perf(min_ms), perf(max_ms)
+        return ms, min_ms, max_ms
     benckmark.run(show_plots=True, print_data=True)
 
 #

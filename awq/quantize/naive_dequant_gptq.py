@@ -114,35 +114,38 @@ def dequant248(qweight, scales, qzeros, g_idx, bits, maxq=None):
 
 
 def quant_matmul_248_stream(
-    layers, input, qweight, scales, qzeros, g_idx, bits, maxq=None, transpose=True, stream1=torch.cuda.current_stream(),
+    input, qweight, scales, qzeros, g_idx, bits, maxq=None, transpose=True, stream1=torch.cuda.current_stream(),
         stream2=torch.cuda.current_stream(),
 ):
-    events = [torch.cuda.Event() for _ in range(layers)]
 
-    for i in range(layers):
-        if i == 0:
-            with torch.cuda.stream(stream1):
-                W = dequant248(qweight[i], scales[i], qzeros[i], g_idx, bits, maxq=maxq)
-                events[0].record()
-            with torch.cuda.stream(stream2):
-                events[0].wait(stream2)
-                if transpose:
-                    out = torch.matmul(input[i], W.t())
-                else:
-                    out = torch.matmul(input[i], W)
+    with torch.cuda.stream(stream1):
+        W = dequant248(qweight, scales, qzeros, g_idx, bits, maxq=maxq)
+
+    with torch.cuda.stream(stream2):
+
+        if transpose:
+            out = torch.matmul(input, W.t())
         else:
-            with torch.cuda.stream(stream1):
-                events[i-1].wait(stream1)
-                W = dequant248(qweight[i], scales[i], qzeros[i], g_idx, bits, maxq=maxq)
-                events[i].record()
-
-            with torch.cuda.stream(stream2):
-                events[i].wait(stream2)
-                if transpose:
-                    out = torch.matmul(input[i], W.t())
-                else:
-                    out = torch.matmul(input[i], W)
+            out = torch.matmul(input, W)
+    stream2.wait_stream(stream1)
     torch.cuda.synchronize()
+    return out
+
+
+def quant_matmul_248_stream_withoutSyn(
+    input, ref_weight, qweight, scales, qzeros, g_idx, bits, maxq=None, transpose=True, stream1=torch.cuda.current_stream(),
+        stream2=torch.cuda.current_stream(),
+):
+
+    with torch.cuda.stream(stream1):
+        W = dequant248(qweight, scales, qzeros, g_idx, bits, maxq=maxq)
+
+    with torch.cuda.stream(stream2):
+
+        if transpose:
+            out = torch.matmul(input, ref_weight.t())
+        else:
+            out = torch.matmul(input, ref_weight)
     return out
 
 def quant_matmul_248(

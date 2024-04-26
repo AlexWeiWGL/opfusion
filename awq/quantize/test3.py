@@ -3,6 +3,8 @@ import torch
 import triton
 import triton.language as tl
 import awq_inference_engine
+from matplotlib import pyplot as plt
+
 import dequant_gptq
 import naive_dequant_gptq
 
@@ -51,13 +53,13 @@ def gemm_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BLOCK_SIZE_N: tl.constexpr, BLOCK_
     tl.store(c_ptr+ c_ptrs, c)
 
 
-def gemm(a, b):
-    c = torch.empty([M, N], device=a.device, dtype=a.dtype)
-    grid = lambda META: (
-        triton.cdiv(M, META['BLOCK_SIZE_M']), triton.cdiv(N, META['BLOCK_SIZE_N']),
-    )
-    gemm_kernel[grid](a, b, c, M, N, K)
-    return c
+# def gemm(a, b):
+#     c = torch.empty([M, N], device=a.device, dtype=a.dtype)
+#     grid = lambda META: (
+#         triton.cdiv(M, META['BLOCK_SIZE_M']), triton.cdiv(N, META['BLOCK_SIZE_N']),
+#     )
+#     gemm_kernel[grid](a, b, c, M, N, K)
+#     return c
 
 @triton.jit
 def _zp_dequant_kernel(
@@ -165,19 +167,81 @@ def w4a16_matmul(x, w, qweight, scales, qzeros, group_size):
     return c
 
 
+N, K = 4096, 4096
+batch_size = [64*i for i in range(10, 51)]
+inputs = [torch.randn((M, K), device='cuda', dtype=torch.float16) for M in batch_size]
+input_layers = []
+layers = 10
+
+for M in batch_size:
+    for j in range(layers):
+      input_layers.append(torch.randn((M, K), device='cuda', dtype=torch.float16))
+
+
+
+def evaluate_kernel(inputs):
+    def record_time(func):
+        def wrapper(*args, **kwargs):
+            for _ in range(10):
+                func(*args, **kwargs)
+
+            start_events = [torch.cuda.Event(enable_timing=True) for _ in range(len(batch_size))]
+            end_events = [torch.cuda.Event(enable_timing=True) for _ in range(len(batch_size))]
+
+            for i in range(len(inputs)):
+                new_args = list(args)
+                new_args[0] = inputs[i]
+                start_events[i].record()
+                func(*new_args, **kwargs)
+                end_events[i].record()
+            torch.cuda.synchronize()
+            times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+            return times
+        return wrapper
+    return record_time
+
+
+def evaluate_layers_kernel(inputs, layers):
+    def record_layer_time(func):
+        def wrapper(*args, **kwargs):
+            for j in range(10):
+                new_args = list(args)
+                new_args[1] = inputs[j * layers: (j + 1) * layers]
+                func(*new_args, **kwargs)
+
+            start_events = [torch.cuda.Event(enable_timing=True) for _ in range(len(batch_size))]
+            end_events = [torch.cuda.Event(enable_timing=True) for _ in range(len(batch_size))]
+
+            for i in range(len(batch_size)):
+                new_args = list(args)
+                new_args[1] = inputs[i*layers: (i+1)*layers]
+                start_events[i].record()
+                func(*new_args, **kwargs)
+                end_events[i].record()
+            torch.cuda.synchronize()
+            times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+            return times
+        return wrapper
+    return record_layer_time
+
+@evaluate_kernel(inputs=inputs)
 def gptq_stream_matmul(a, qweight, scales, qzeros, group_size, stream1, stream2):
     g_idx = torch.tensor([i//group_size for i in range(4096)], device='cuda')
     naive_dequant_gptq.quant_matmul_248_stream(a, qweight, scales, qzeros, g_idx, 4, stream1=stream1, stream2=stream2)
 
+
+@evaluate_kernel(inputs=inputs)
 def gptq_matmul(a, qweight, scales, qzeros, group_size):
     g_idx = torch.tensor([i//group_size for i in range(4096)], device='cuda')
     dequant_gptq.quant_matmul_248(a, qweight, scales, qzeros, g_idx, 4)
 
-
+@evaluate_kernel(inputs=inputs)
 def gptq_matmul_withoutSyn(a, ref_weight, qweight, scales, qzeros, group_size, stream1, stream2):
     g_idx = torch.tensor([i // group_size for i in range(4096)], device='cuda')
     naive_dequant_gptq.quant_matmul_248_stream_withoutSyn(a, ref_weight, qweight, scales, qzeros, g_idx, 4, stream1=stream1, stream2=stream2)
 
+
+@evaluate_kernel(inputs=inputs)
 def triton_matmul(a,ref_weight, qweight, scales, qzeros, group_size, stream1, stream2):
     block_size_n = 128
     K = a.shape[1]
@@ -208,12 +272,46 @@ def triton_matmul(a,ref_weight, qweight, scales, qzeros, group_size, stream1, st
     with torch.cuda.stream(stream2):
         torch.matmul(a, ref_weight)
     stream2.wait_stream(stream1)
+    torch.cuda.synchronize()
 
+@evaluate_layers_kernel(inputs=input_layers, layers=layers)
+def gptq_stream_matmul_layers(layers, a, qweight, scales, qzeros, group_size, stream1, stream2):
+
+    g_idx = torch.tensor([i // group_size for i in range(4096)], device='cuda')
+    dequant_gptq.quant_matmul_248_stream(layers, a, qweight, scales, qzeros, g_idx, 4, stream1=stream1, stream2=stream2)
+
+
+@evaluate_layers_kernel(inputs=input_layers, layers=layers)
+def gptq_matmul_layers(layers, a, qweight, scales, qzeros, group_size):
+    for i in range(layers):
+        dequant_gptq.quant_matmul_248(a, qweight, scales, qzeros, group_size, 4)
+
+# @evaluate_kernel(10)
+# def gptq_dequant_kernel(qweight, scales, qzeros, g_idx, bits, maxq=None):
+#     naive_dequant_gptq.dequant248(qweight, scales, qzeros, g_idx, bits, maxq=maxq)
+
+
+@evaluate_kernel(inputs=inputs)
+def fp16_kernel(mat_inputs, weight):
+    torch.matmul(mat_inputs, weight)
+    torch.cuda.synchronize()
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    M, N, K = 10, 4096, 4096
+    M, N, K = 2000, 4096, 4096
     group_size = 128
+
+    qweights = []
+    scaless = []
+    qzeross = []
+
+    for j in range(layers):
+        qweights.append(
+            torch.randint(low=-2147483648, high=2147483647, size=(K // 8, N), device='cuda', dtype=torch.int32))
+        scaless.append(torch.randn((K // group_size, N), device='cuda', dtype=torch.float16))
+        qzeross.append(
+            torch.randint(low=-2147483648, high=2147483647, size=(K // group_size, N // 8), device='cuda',
+                          dtype=torch.int32))
 
     a = torch.randn((M, K), device='cuda', dtype=torch.float16)
     qweight = torch.randint(low=-2147483648, high=2147483647, size=(K // 8, N), device='cuda', dtype=torch.int32)
@@ -224,72 +322,24 @@ if __name__ == "__main__":
 
     stream1 = torch.cuda.Stream('cuda')
     stream2 = torch.cuda.current_stream('cuda')
-
     stream3 = torch.cuda.Stream('cuda')
-    stream4 = torch.cuda.Stream('cuda')
+    g_idx = torch.tensor([i // group_size for i in range(4096)], device='cuda')
 
-    # print(qweight.short())
-    # print(qzeros.to(torch.float16))
-    #
-    # print("Zeropoint quantization.")
-    # awq_output = awq_inference_engine.gemm_forward_cuda_new(a, qweight.short(), scales, qzeros)
-    # triton_output = w4a16_matmul(a, ref_weight, qweight.to(torch.int32), scales, qzeros, group_size, sym=False)
-    # torch_output = torch_w4a16_matmul(a, qweight, scales, qzeros.to(torch.int32), group_size, sym=False)
-    # print(f"triton_output={triton_output}")
-    # print(f"torch_output={torch_output}")
-    # print(f"awq_output={awq_output}")
-    #print(f'The maximum difference between torch and triton is {torch.max(torch.abs(awq_output - triton_output))}')
+    # gptq_matmul_result = gptq_matmul(a, qweight, scales, qzeros, group_size)
+    # gptq_stream_matmul_result = gptq_stream_matmul(a, qweight, scales, qzeros, group_size, stream1, stream2)
+    # gptq_matmul_withoutSyn_result = gptq_matmul_withoutSyn(a, ref_weight, qweight, scales, qzeros, group_size, stream3, stream2)
+    # fp16_result = fp16_kernel(a, ref_weight)
+    gptq_matmul_result = gptq_stream_matmul_layers(layers,input_layers, qweights, scaless, qzeross, group_size, stream1, stream2)
 
-
-    # benchmark
-    print(f"\nBenchmark with bs={M}.")
-    print("torch zp:", triton.testing.do_bench(lambda: torch_w4a16_matmul(a, qweight, scales, qzeros, group_size)))
-    print("triton zp:", triton.testing.do_bench(lambda: triton_matmul(a, ref_weight, qweight, scales, qzeros, group_size, stream1, stream2)))
-    print("fp16", triton.testing.do_bench(lambda: torch.matmul(a, ref_weight)))
-    #print("gptq", triton.testing.do_bench(lambda: gptq_stream_matmul(a, qweight, scales, qzeros, group_size, stream1, stream2)))
-    @triton.testing.perf_report(
-        triton.testing.Benchmark(
-            x_names=['M'],
-            x_vals=[64 *i for i in range(10, 51)],
-            line_arg='provider',
-            line_vals=['fp16', 'gptq',  'torch', 'gptq_nosyn'], #'triton_stream', 'torch', 'gptq_stream', 'triton',
-            line_names=["FP16_matmul",'GPTQ_w4a16_matmul','Torch_w4a16_matmul', 'GPTQ_stream_withoutSync_w4a16_matmul'], #'GPTQ_stream_w4a16_matmul',
-            styles=[('green', '-'), ('blue', '-'), ('red', '-'), ('black', '-'),  ('orange', '-')],
-            ylabel = 'TIME(ms)',
-            plot_name='different matmal methods',
-            args={},
-        )
-    )
-
-    def benckmark(M, provider):
-        ms = 1
-        max_ms = 1
-        min_ms = 1
-        a = torch.randn((M, K), device='cuda', dtype=torch.float16)
-        qweight = torch.randint(low=-2147483648, high=2147483647, size=(K // 8, N), device='cuda', dtype=torch.int32)
-        scales = torch.randn((K // group_size, N), device='cuda', dtype=torch.float16)
-        qzeros = torch.randint(low=-2147483648, high=2147483647, size=(K // group_size, N // 8), device='cuda',
-                               dtype=torch.int32)
-        ref_weight = torch.randn((K, N), device='cuda', dtype=torch.float16)
-
-        quantiles = [0.5, 0.2, 0.8]
-        if provider == 'fp16':
-            ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, ref_weight), quantiles=quantiles)
-        # if provider == 'triton_stream':
-        #     ms, min_ms, max_ms = triton.testing.do_bench(lambda: triton_matmul(a, ref_weight, qweight, scales, qzeros, group_size, stream1, stream2), quantiles=quantiles)
-        if provider == 'torch':
-            ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch_w4a16_matmul(a, qweight, scales, qzeros, group_size), quantiles=quantiles)
-        # if provider == 'gptq_stream':
-        #     ms, min_ms, max_ms = triton.testing.do_bench(lambda: gptq_stream_matmul(a, qweight, scales, qzeros, group_size, stream1, stream2), quantiles=quantiles)
-        #if provider == 'triton':
-        #     ms, min_ms, max_ms = triton.testing.do_bench(lambda: w4a16_matmul(a, ref_weight, qweight, scales, qzeros, group_size), quantiles=quantiles)
-        if provider == 'gptq':
-            ms, min_ms, max_ms = triton.testing.do_bench(lambda: gptq_matmul(a, qweight, scales, qzeros, group_size), quantiles=quantiles)
-        if provider == 'gptq_nosyn':
-            ms, min_ms, max_ms = triton.testing.do_bench(lambda: gptq_matmul_withoutSyn(a, ref_weight, qweight, scales, qzeros, group_size, stream3, stream2), quantiles=quantiles)
-        perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
-        return ms, max_ms, min_ms
-    benckmark.run(show_plots=True, print_data=True)
-
-    #
-    #
+    print("gptq matmul: ", gptq_matmul_result)
+    # print("gptq stream matmul", gptq_stream_matmul_result)
+    # print("gptq matmul withoutSyn:", gptq_matmul_withoutSyn_result)
+    # # print("gptq dequant kernel", gptq_dequant_kernel(qweight, scales, qzeros, g_idx, 4))
+    # print("fp16 kernel", fp16_result)
+    # fig, ax = plt.subplots()
+    # ax.plot(batch_size, gptq_matmul_result, color='red', linestyle='-', label='gptq matmul')
+    # ax.plot(batch_size, gptq_stream_matmul_result, color='blue', linestyle='-', label='gptq matmul with stream')
+    # ax.plot(batch_size, gptq_matmul_withoutSyn_result, color='black', linestyle='-', label='gptq matmul without synchronize')
+    # ax.plot(batch_size, fp16_result, color='green', linestyle='-', label='fp16')
+    # ax.legend()
+    # plt.show()
